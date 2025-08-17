@@ -1,1 +1,6 @@
+// Detect rare DNS queries that may indicate C2 activity
+DnsEvents
+| summarize Count = count() by QueryName
+| where Count < 5
+| order by Count asc
 
