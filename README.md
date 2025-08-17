@@ -26,6 +26,17 @@ kql-hunting-scripts/
 └── cloud/            # Office 365, Azure AD, cloud-native threats
 
 ```
+🚀 Getting Started
+
+Open Microsoft Sentinel → Logs blade.
+
+Paste the .kql script into the query editor.
+
+Adjust filters (e.g., time range, user, host) to match your environment.
+
+Run the query to analyze results.
+
+
 ⚠️ Disclaimer
 
 These queries are provided for educational and detection engineering purposes only.
