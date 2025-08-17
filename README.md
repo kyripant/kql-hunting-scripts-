@@ -14,18 +14,7 @@ This repository contains categorized hunting queries covering:
 
 Each query is optimized for **threat hunting**, **incident response**, and **proactive detection** in enterprise environments.
 
----
 
-## 📂 Repository Structure
-```bash
-kql-hunting-scripts/
-│
-├── authentication/   # Sign-in anomalies, brute-force, account misuse
-├── network/          # DNS tunneling, lateral movement, port scans
-├── endpoint/         # Malware behavior, suspicious commands, persistence
-└── cloud/            # Office 365, Azure AD, cloud-native threats
-
-```
 🚀 Getting Started
 
 Open Microsoft Sentinel → Logs blade.
