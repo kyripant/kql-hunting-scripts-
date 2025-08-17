@@ -1,1 +1,7 @@
+// Detect brute force login attempts (failed logins in a short window)
+SigninLogs
+| summarize FailedLogins = countif(ResultType != 0) 
+    by UserPrincipalName, bin(TimeGenerated, 5m)
+| where FailedLogins > 10
+| order by FailedLogins desc
 
