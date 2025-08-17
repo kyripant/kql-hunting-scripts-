@@ -25,6 +25,7 @@ kql-hunting-scripts/
 ├── endpoint/         # Malware behavior, suspicious commands, persistence
 └── cloud/            # Office 365, Azure AD, cloud-native threats
 
+```
 ⚠️ Disclaimer
 
 These queries are provided for educational and detection engineering purposes only.
