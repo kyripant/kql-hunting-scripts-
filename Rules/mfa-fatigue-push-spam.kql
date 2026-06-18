@@ -1,0 +1,97 @@
+// ─────────────────────────────────────────────────────────
+// Rule Name    : MFA Fatigue — Excessive Push Notifications
+// Description  : Detects a high volume of MFA push denials or timeouts
+//                for a single user within a short window, indicating a
+//                push spam / MFA fatigue attack. Threat actors bombard
+//                users with prompts hoping for an accidental approval.
+//                Observed in Lapsus$, Midnight Blizzard, and commodity
+//                ransomware pre-access campaigns.
+// Category     : Identity
+// MITRE ATT&CK : Credential Access — T1621 (Multi-Factor Authentication Request Generation)
+// Severity     : High
+// Frequency    : Every 15m
+// Author       : Kyriakos / SOC Team
+// Last Updated : 2025-06-01
+// References   :
+//   - https://attack.mitre.org/techniques/T1621/
+//   - https://www.microsoft.com/en-us/security/blog/2022/08/24/microsoft-investigates-iranian-threat-actor-nobelium/
+//   - https://learn.microsoft.com/en-us/entra/id-protection/concept-identity-protection-risks
+// ─────────────────────────────────────────────────────────
+
+// --- TUNING NOTES ---
+// PushDenialThreshold: Lower in high-security environments (e.g. 5).
+//   In large tenants with many mobile workers, occasional denials are normal.
+//   A burst of 10+ in 20 minutes is almost always adversarial.
+// Also watch for a successful sign-in AFTER a burst — that's the fatigue succeeding.
+// Pair this alert with a Sentinel watchlist of VIP/privileged users for auto-escalation.
+// ─────────────────────────────────────────────────────────
+
+let LookbackPeriod      = 20m;
+let PushDenialThreshold = 10;   // Number of MFA push failures to trigger alert
+let ObservationWindow   = 20m;  // Rolling window for counting denials
+
+// MFA push denials appear in SigninLogs with specific ResultType codes
+let MFADenialCodes = dynamic([
+    500121,  // Authentication failed during strong authentication request
+    50074,   // Strong authentication required — user did not satisfy MFA
+    50076,   // User did not satisfy MFA requirements (no response / timeout)
+    50079,   // User required to re-register for MFA
+    500133,  // User did not complete MFA in required time
+    50158    // External security challenge not satisfied (push denied/timed out)
+]);
+
+SigninLogs
+| where TimeGenerated >= ago(LookbackPeriod)
+| where ResultType in (MFADenialCodes)
+| where AuthenticationRequirement == "multiFactorAuthentication"
+// Focus on interactive push — exclude legacy auth and non-push MFA methods
+| mv-expand AuthenticationDetails
+| extend
+    MFAMethod = tostring(AuthenticationDetails.authenticationMethod),
+    MFAResult = tostring(AuthenticationDetails.succeeded)
+| where MFAMethod in ("Phone appnotification", "Mobile app notification")
+| where MFAResult == "false"
+| summarize
+    DenialCount      = count(),
+    FirstDenial      = min(TimeGenerated),
+    LastDenial       = max(TimeGenerated),
+    SourceIPs        = make_set(IPAddress),
+    Countries        = make_set(LocationDetails.countryOrRegion),
+    TargetApps       = make_set(AppDisplayName),
+    ResultTypes      = make_set(ResultType),
+    UserAgents       = make_set(UserAgent)
+    by UserPrincipalName, bin(TimeGenerated, ObservationWindow)
+| where DenialCount >= PushDenialThreshold
+// Check if a successful sign-in followed the burst — fatigue may have succeeded
+| join kind=leftouter (
+    SigninLogs
+    | where TimeGenerated >= ago(LookbackPeriod)
+    | where ResultType == 0
+    | where AuthenticationRequirement == "multiFactorAuthentication"
+    | summarize SuccessfulSigninAfterBurst = count(), SuccessTime = min(TimeGenerated)
+        by UserPrincipalName
+) on UserPrincipalName
+| extend
+    FatigueSucceeded = isnotnull(SuccessfulSigninAfterBurst) and SuccessTime > LastDenial,
+    Severity         = iff(isnotnull(SuccessfulSigninAfterBurst) and SuccessTime > LastDenial, "Critical", "High"),
+    RiskReason       = strcat(
+        DenialCount, " MFA push denials in ", ObservationWindow, " minutes.",
+        iff(FatigueSucceeded, " ⚠️ Successful MFA sign-in detected AFTER the burst — fatigue may have succeeded.", "")
+    ),
+    MitreTactic    = "Credential Access",
+    MitreTechnique = "T1621"
+| project
+    FirstDenial,
+    LastDenial,
+    UserPrincipalName,
+    DenialCount,
+    FatigueSucceeded,
+    SuccessTime,
+    SourceIPs,
+    Countries,
+    TargetApps,
+    Severity,
+    RiskReason,
+    MitreTactic,
+    MitreTechnique
+| order by FatigueSucceeded desc, DenialCount desc
