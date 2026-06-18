@@ -1,0 +1,140 @@
+// ─────────────────────────────────────────────────────────
+// Rule Name    : DNS Tunneling — High Query Rate and Long Subdomain Detection
+// Description  : Identifies potential DNS tunneling by detecting assets that
+//                generate an abnormally high number of DNS queries to a single
+//                domain, or queries containing unusually long subdomains.
+//                DNS tunneling encodes data in subdomain labels to exfiltrate
+//                data or maintain C2 over port 53, which is rarely filtered.
+//                Tools: iodine, dnscat2, DNSExfiltrator, custom implants.
+// Category     : Network
+// MITRE ATT&CK : Command and Control — T1071.004 (Application Layer Protocol: DNS)
+//                Exfiltration — T1048.003 (Exfiltration Over Alternative Protocol)
+// Severity     : Medium
+// Frequency    : Every 1h
+// Author       : Kyriakos / SOC Team
+// Last Updated : 2025-06-01
+// References   :
+//   - https://attack.mitre.org/techniques/T1071/004/
+//   - https://attack.mitre.org/techniques/T1048/003/
+//   - https://github.com/yarrick/iodine
+// ─────────────────────────────────────────────────────────
+
+// --- TUNING NOTES ---
+// SubdomainLengthThreshold: 40 chars is a strong signal. CDNs and cloud services
+//   occasionally use long subdomains legitimately — add those domains to ExcludedDomains.
+// QueryRateThreshold: 200 queries/hour to a single TLD is high. Adjust for environment.
+//   Large software update services (Windows Update, antivirus) can generate bursts —
+//   baseline your environment and add noisy legitimate domains to ExcludedDomains.
+// EntropyThreshold: High-entropy subdomains (random-looking strings) are a strong
+//   indicator of encoded data. Legitimate services use readable subdomain names.
+// ─────────────────────────────────────────────────────────
+
+let LookbackPeriod          = 1h;
+let QueryRateThreshold      = 200;   // DNS queries per hour to a single registered domain
+let SubdomainLengthThreshold = 40;   // Characters in the subdomain portion
+let MinSubdomainQueryCount  = 20;    // Minimum long-subdomain queries to trigger
+let EntropyThreshold        = 3.5;   // Shannon entropy of subdomain (higher = more random)
+
+let ExcludedDomains = dynamic([
+    "windowsupdate.com",
+    "microsoft.com",
+    "office.com",
+    "live.com",
+    "azure.com",
+    "akamaiedge.net",
+    "cloudfront.net",
+    "amazonaws.com"
+]);
+
+// Helper: extract registered domain (eTLD+1) from FQDN
+// Simplified — extracts last two labels. For full PSL support, use a watchlist.
+let ExtractRegisteredDomain = (fqdn: string) {
+    let parts = split(fqdn, ".");
+    let n = array_length(parts);
+    strcat(parts[n-2], ".", parts[n-1])
+};
+
+// Helper: approximate Shannon entropy of a string
+// High entropy (> 3.5) suggests base32/base64 encoded data in subdomains
+let ShannonEntropy = (s: string) {
+    let len = strlen(s);
+    let chars = "abcdefghijklmnopqrstuvwxyz0123456789-_";
+    toscalar(
+        range i from 0 to strlen(chars)-1 step 1
+        | extend c = substring(chars, i, 1)
+        | extend cnt = countof(s, c)
+        | where cnt > 0
+        | extend p = todouble(cnt) / todouble(len)
+        | summarize entropy = -sum(p * log2(p))
+    )
+};
+
+DnsEvents
+| where TimeGenerated >= ago(LookbackPeriod)
+| where EventId == 3010  // DNS client query
+| where isnotempty(Name)
+| extend FQDN = tolower(trim_end(".", Name))
+| extend RegisteredDomain = ExtractRegisteredDomain(FQDN)
+| where RegisteredDomain !in (ExcludedDomains)
+// Extract subdomain (everything left of registered domain)
+| extend SubdomainPart = replace_string(FQDN, strcat(".", RegisteredDomain), "")
+| extend SubdomainLength = strlen(SubdomainPart)
+
+// ── Signal 1: High query rate to single registered domain ────────────────────
+| summarize
+    TotalQueries        = count(),
+    LongSubdomainCount  = countif(SubdomainLength >= SubdomainLengthThreshold),
+    AvgSubdomainLength  = avg(SubdomainLength),
+    MaxSubdomainLength  = max(SubdomainLength),
+    UniqueFQDNs         = dcount(FQDN),
+    SampleSubdomains    = make_set(SubdomainPart, 5),
+    FirstSeen           = min(TimeGenerated),
+    LastSeen            = max(TimeGenerated)
+    by Computer, ClientIP, RegisteredDomain
+
+// ── Signal 2: Trigger on high rate OR many long subdomains ───────────────────
+| where TotalQueries >= QueryRateThreshold
+    or LongSubdomainCount >= MinSubdomainQueryCount
+
+// ── Signal 3: Ratio of unique FQDNs (tunneling generates many unique subdomains) ──
+| extend UniquenessRatio = todouble(UniqueFQDNs) / todouble(TotalQueries)
+
+// Score the suspicion level
+| extend SuspicionScore = case(
+    TotalQueries >= QueryRateThreshold and LongSubdomainCount >= MinSubdomainQueryCount, 3,
+    TotalQueries >= QueryRateThreshold and UniquenessRatio > 0.7, 2,
+    LongSubdomainCount >= MinSubdomainQueryCount, 2,
+    1
+)
+| extend
+    Severity = case(
+        SuspicionScore >= 3, "High",
+        SuspicionScore == 2, "Medium",
+        "Low"
+    ),
+    RiskReason = strcat(
+        TotalQueries, " DNS queries to '", RegisteredDomain, "' in 1h. ",
+        LongSubdomainCount, " queries with subdomain > ", SubdomainLengthThreshold, " chars. ",
+        "Unique FQDN ratio: ", round(UniquenessRatio * 100, 1), "%. ",
+        "Possible DNS tunneling via iodine, dnscat2, or custom implant."
+    ),
+    MitreTactic    = "Command and Control",
+    MitreTechnique = "T1071.004"
+| project
+    FirstSeen,
+    LastSeen,
+    Computer,
+    ClientIP,
+    RegisteredDomain,
+    TotalQueries,
+    LongSubdomainCount,
+    AvgSubdomainLength,
+    MaxSubdomainLength,
+    UniquenessRatio = round(UniquenessRatio, 3),
+    SampleSubdomains,
+    SuspicionScore,
+    Severity,
+    RiskReason,
+    MitreTactic,
+    MitreTechnique
+| order by SuspicionScore desc, TotalQueries desc
