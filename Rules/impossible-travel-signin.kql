@@ -1,0 +1,125 @@
+// ─────────────────────────────────────────────────────────
+// Rule Name    : Impossible Travel — Entra ID Sign-in
+// Description  : Detects sign-ins from two geographically distant locations
+//                within a timeframe that makes physical travel impossible.
+//                Common indicator of credential compromise or token theft.
+// Category     : Identity
+// MITRE ATT&CK : Initial Access — T1078 (Valid Accounts)
+// Severity     : Medium (elevate to High if target is privileged account)
+// Frequency    : Every 1h
+// Author       : Kyriakos / SOC Team
+// Last Updated : 2025-06-01
+// References   :
+//   - https://learn.microsoft.com/en-us/entra/id-protection/concept-identity-protection-risks
+//   - https://attack.mitre.org/techniques/T1078/
+// ─────────────────────────────────────────────────────────
+
+// --- TUNING NOTES ---
+// Default impossible travel threshold: 900 km/h (faster than commercial aviation).
+// Increase threshold to reduce noise from VPN/proxy users if needed.
+// Exclude known VPN egress IPs or trusted named locations via the exclusion list.
+// Consider enriching with a watchlist of known VPN/proxy CIDRs.
+// ─────────────────────────────────────────────────────────
+
+let LookbackPeriod       = 4h;
+let SpeedThresholdKmph   = 900;  // km/h — above this = physically impossible
+let ExcludedCountries    = dynamic(["ZZ"]); // Add known VPN/proxy country codes
+
+// Helper: basic Haversine distance via lat/lon
+// Note: Sentinel KQL does not have a native geo_distance function in all SKUs.
+// This uses a simplified approximation suitable for coarse impossible travel checks.
+let haversine = (lat1:real, lon1:real, lat2:real, lon2:real) {
+    let R = 6371.0; // Earth radius in km
+    let dLat = radians(lat2 - lat1);
+    let dLon = radians(lon2 - lon1);
+    let a = sin(dLat/2)*sin(dLat/2) + cos(radians(lat1))*cos(radians(lat2))*sin(dLon/2)*sin(dLon/2);
+    R * 2 * atan2(sqrt(a), sqrt(1-a))
+};
+
+SigninLogs
+| where TimeGenerated >= ago(LookbackPeriod)
+| where ResultType == 0  // Successful sign-ins only
+| where isnotempty(LocationDetails)
+| where CountryOrRegion !in (ExcludedCountries)
+| extend
+    Latitude  = toreal(LocationDetails.geoCoordinates.latitude),
+    Longitude = toreal(LocationDetails.geoCoordinates.longitude),
+    Country   = tostring(LocationDetails.countryOrRegion),
+    City      = tostring(LocationDetails.city)
+| where isnotnull(Latitude) and isnotnull(Longitude)
+| project
+    TimeGenerated,
+    UserPrincipalName,
+    IPAddress,
+    Country,
+    City,
+    Latitude,
+    Longitude,
+    AppDisplayName,
+    AuthenticationRequirement,
+    ConditionalAccessStatus,
+    UserAgent
+// Self-join to find pairs of sign-ins for the same user
+| join kind=inner (
+    SigninLogs
+    | where TimeGenerated >= ago(LookbackPeriod)
+    | where ResultType == 0
+    | where isnotempty(LocationDetails)
+    | extend
+        Latitude2  = toreal(LocationDetails.geoCoordinates.latitude),
+        Longitude2 = toreal(LocationDetails.geoCoordinates.longitude),
+        Country2   = tostring(LocationDetails.countryOrRegion),
+        City2      = tostring(LocationDetails.city)
+    | where isnotnull(Latitude2) and isnotnull(Longitude2)
+    | project
+        TimeGenerated2    = TimeGenerated,
+        UserPrincipalName,
+        IPAddress2        = IPAddress,
+        Country2,
+        City2,
+        Latitude2,
+        Longitude2,
+        AppDisplayName2   = AppDisplayName
+) on UserPrincipalName
+// Only look at sign-in pairs where the second is AFTER the first
+| where TimeGenerated2 > TimeGenerated
+// Calculate time delta in hours
+| extend TimeDeltaHours = datetime_diff('minute', TimeGenerated2, TimeGenerated) / 60.0
+| where TimeDeltaHours > 0 and TimeDeltaHours <= 4  // Focus on events within 4 hours
+// Calculate distance
+| extend DistanceKm = haversine(Latitude, Longitude, Latitude2, Longitude2)
+| where DistanceKm > 100  // Ignore very close sign-ins (same city, different ISP egress)
+// Calculate required travel speed
+| extend RequiredSpeedKmph = DistanceKm / TimeDeltaHours
+| where RequiredSpeedKmph > SpeedThresholdKmph
+// Summarize and rank
+| summarize
+    FirstSigninTime  = min(TimeGenerated),
+    SecondSigninTime = min(TimeGenerated2),
+    Location1        = strcat(City, ", ", Country),
+    Location2        = strcat(City2, ", ", Country2),
+    DistanceKm       = max(DistanceKm),
+    RequiredSpeedKmph = max(RequiredSpeedKmph),
+    IP1              = make_set(IPAddress),
+    IP2              = make_set(IPAddress2)
+    by UserPrincipalName
+| extend
+    Severity      = "Medium",
+    RiskReason    = strcat("User signed in from two locations ", round(DistanceKm, 0), " km apart within ", round(datetime_diff('minute', SecondSigninTime, FirstSigninTime) / 60.0, 1), " hours. Implied speed: ", round(RequiredSpeedKmph, 0), " km/h."),
+    MitreTactic   = "Initial Access",
+    MitreTechnique = "T1078"
+| project
+    FirstSigninTime,
+    SecondSigninTime,
+    UserPrincipalName,
+    Location1,
+    Location2,
+    DistanceKm,
+    RequiredSpeedKmph,
+    IP1,
+    IP2,
+    Severity,
+    RiskReason,
+    MitreTactic,
+    MitreTechnique
+| order by RequiredSpeedKmph desc
