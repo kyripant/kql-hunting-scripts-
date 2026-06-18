@@ -1,0 +1,135 @@
+// ─────────────────────────────────────────────────────────
+// Rule Name    : CISA KEV IOC Match via Watchlist
+// Description  : Matches network traffic or DNS events against a watchlist
+//                populated with CVEs from CISA's Known Exploited Vulnerabilities
+//                catalog. Flags assets communicating with infrastructure
+//                associated with actively exploited vulnerabilities.
+//                Pairs with a Logic App that auto-ingests the CISA KEV feed daily.
+// Category     : Threat Intelligence
+// MITRE ATT&CK : Multiple — depends on the specific KEV entry
+//                (Initial Access T1190, Execution T1203, etc.)
+// Severity     : High
+// Frequency    : Every 1h
+// Author       : Kyriakos / SOC Team
+// Last Updated : 2025-06-01
+// References   :
+//   - https://www.cisa.gov/known-exploited-vulnerabilities-catalog
+//   - https://learn.microsoft.com/en-us/azure/sentinel/watchlists
+// ─────────────────────────────────────────────────────────
+
+// --- TUNING NOTES ---
+// This rule assumes a Sentinel Watchlist named "CISA_KEV" with the following columns:
+//   - cveID         : e.g., "CVE-2024-12345"
+//   - vendorProject : e.g., "Microsoft"
+//   - product        : e.g., "Windows"
+//   - dueDate        : CISA remediation due date
+//   - knownRansomware: "Known" | "Unknown"
+//   - iocValue       : IP, domain, or URL associated with exploitation
+//   - iocType        : "IP" | "Domain" | "URL"
+//
+// The Logic App ingestion pipeline handles deduplication before watchlist write.
+// See /playbooks/cisa-kev-ingest-logicapp.json for the automation template.
+// ─────────────────────────────────────────────────────────
+
+let LookbackPeriod = 1h;
+
+// Load the CISA KEV watchlist
+let CISA_KEV_IPs = (
+    _GetWatchlist("CISA_KEV")
+    | where iocType == "IP"
+    | project iocValue, cveID, vendorProject, product, dueDate, knownRansomware
+);
+
+let CISA_KEV_Domains = (
+    _GetWatchlist("CISA_KEV")
+    | where iocType == "Domain"
+    | project iocValue, cveID, vendorProject, product, dueDate, knownRansomware
+);
+
+// ── IP Match: CommonSecurityLog (Firewall / Network) ─────────────────────────
+let IPMatches = (
+    CommonSecurityLog
+    | where TimeGenerated >= ago(LookbackPeriod)
+    | where isnotempty(DestinationIP)
+    | join kind=inner CISA_KEV_IPs on $left.DestinationIP == $right.iocValue
+    | extend
+        MatchType     = "IP",
+        MatchedIOC    = DestinationIP,
+        SourceAsset   = DeviceName,
+        SourceIP      = SourceIP,
+        DestPort      = DestinationPort,
+        Direction     = "Outbound"
+    | project
+        TimeGenerated,
+        MatchType,
+        MatchedIOC,
+        SourceAsset,
+        SourceIP,
+        DestPort,
+        Direction,
+        cveID,
+        vendorProject,
+        product,
+        dueDate,
+        knownRansomware
+);
+
+// ── Domain Match: DnsEvents ───────────────────────────────────────────────────
+let DomainMatches = (
+    DnsEvents
+    | where TimeGenerated >= ago(LookbackPeriod)
+    | where EventId == 3010  // DNS query
+    | where isnotempty(Name)
+    | join kind=inner CISA_KEV_Domains on $left.Name == $right.iocValue
+    | extend
+        MatchType   = "Domain",
+        MatchedIOC  = Name,
+        SourceAsset = Computer,
+        SourceIP    = ClientIP,
+        DestPort    = int(53),
+        Direction   = "DNS Query"
+    | project
+        TimeGenerated,
+        MatchType,
+        MatchedIOC,
+        SourceAsset,
+        SourceIP,
+        DestPort,
+        Direction,
+        cveID,
+        vendorProject,
+        product,
+        dueDate,
+        knownRansomware
+);
+
+// ── Union and enrich ──────────────────────────────────────────────────────────
+union IPMatches, DomainMatches
+| extend
+    IsRansomwareLinked = (knownRansomware == "Known"),
+    Severity           = iff(knownRansomware == "Known", "Critical", "High"),
+    RiskReason         = strcat(
+        "Asset communicated with IOC associated with ", cveID,
+        " (", vendorProject, " ", product, ").",
+        iff(knownRansomware == "Known", " This CVE is linked to active ransomware campaigns.", "")
+    ),
+    MitreTactic   = "Initial Access",
+    MitreTechnique = "T1190"
+| project
+    TimeGenerated,
+    SourceAsset,
+    SourceIP,
+    MatchType,
+    MatchedIOC,
+    DestPort,
+    Direction,
+    cveID,
+    vendorProject,
+    product,
+    dueDate,
+    IsRansomwareLinked,
+    Severity,
+    RiskReason,
+    MitreTactic,
+    MitreTechnique
+| order by IsRansomwareLinked desc, TimeGenerated desc
