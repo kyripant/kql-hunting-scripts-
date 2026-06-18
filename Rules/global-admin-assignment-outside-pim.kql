@@ -1,0 +1,81 @@
+// ─────────────────────────────────────────────────────────
+// Rule Name    : Global Administrator Role Assignment Outside PIM
+// Description  : Detects direct Global Admin role assignments in Entra ID
+//                that bypass Privileged Identity Management (PIM).
+//                Direct assignments create standing privileged access,
+//                increasing the blast radius of a compromised account.
+// Category     : Identity
+// MITRE ATT&CK : Privilege Escalation — T1078.004 (Valid Accounts: Cloud Accounts)
+// Severity     : High
+// Frequency    : Every 1h (or run as Scheduled Analytics Rule)
+// Author       : Kyriakos / SOC Team
+// Last Updated : 2025-06-01
+// References   :
+//   - https://learn.microsoft.com/en-us/entra/identity/role-based-access-control/best-practices
+//   - https://attack.mitre.org/techniques/T1078/004/
+// ─────────────────────────────────────────────────────────
+
+// --- TUNING NOTES ---
+// Exclude break-glass accounts by adding their ObjectIDs to the exclusion list.
+// In most tenants, ANY direct Global Admin assignment is worth investigating.
+// Consider pairing with a Sentinel watchlist of approved admin ObjectIDs.
+// ─────────────────────────────────────────────────────────
+
+let ExcludedAccounts = dynamic([
+    // Add break-glass or approved admin ObjectIDs here
+    // "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+]);
+
+let LookbackPeriod = 1h;
+
+AuditLogs
+| where TimeGenerated >= ago(LookbackPeriod)
+| where OperationName in ("Add member to role", "Add eligible member to role")
+| where Result == "success"
+// Focus on Global Administrator role only
+| mv-expand TargetResources
+| extend RoleName = tostring(TargetResources.displayName)
+| where RoleName == "Global Administrator"
+// Extract the actor (who made the assignment)
+| extend
+    InitiatedByUPN   = tostring(InitiatedBy.user.userPrincipalName),
+    InitiatedByIP    = tostring(InitiatedBy.user.ipAddress),
+    InitiatedByAppId = tostring(InitiatedBy.app.appId)
+// Extract the target (who received the role)
+| mv-expand TargetResources
+| extend
+    TargetUPN      = tostring(TargetResources.userPrincipalName),
+    TargetObjectId = tostring(TargetResources.id),
+    TargetType     = tostring(TargetResources.type)
+| where TargetType == "User"
+// Exclude known break-glass accounts
+| where TargetObjectId !in (ExcludedAccounts)
+// Detect assignments NOT made through PIM (PIM assignments show specific app context)
+| where InitiatedByAppId != "01fc33a7-78ba-4d2f-a4b7-768e336e890e" // PIM service principal
+// Deduplicate: one row per target user per assignment event
+| summarize
+    AssignmentCount  = count(),
+    AssignedBy       = make_set(InitiatedByUPN),
+    SourceIPs        = make_set(InitiatedByIP),
+    FirstSeen        = min(TimeGenerated),
+    LastSeen         = max(TimeGenerated)
+    by TargetUPN, TargetObjectId, RoleName
+| extend
+    Severity   = "High",
+    RiskReason = "Global Administrator role assigned directly (outside PIM). Standing privileged access detected.",
+    MitreTactic    = "Privilege Escalation",
+    Mitretechnique = "T1078.004"
+| project
+    FirstSeen,
+    LastSeen,
+    TargetUPN,
+    TargetObjectId,
+    RoleName,
+    AssignedBy,
+    SourceIPs,
+    AssignmentCount,
+    Severity,
+    RiskReason,
+    MitreTactic,
+    Mitretechnique
+| order by FirstSeen desc
