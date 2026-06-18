@@ -1,0 +1,126 @@
+// ─────────────────────────────────────────────────────────
+// Rule Name    : Beaconing Detection — Periodic Outbound Connections
+// Description  : Identifies hosts making highly periodic outbound connections
+//                to the same external IP or domain, consistent with C2 beacon
+//                behaviour. Malware frameworks (Cobalt Strike, Metasploit,
+//                Sliver, Brute Ratel) use configurable sleep intervals with
+//                optional jitter. This rule calculates time-delta variance
+//                between connections — low variance = high periodicity = beacon.
+// Category     : Network
+// MITRE ATT&CK : Command and Control — T1071 (Application Layer Protocol)
+//                Command and Control — T1571 (Non-Standard Port)
+//                Command and Control — T1132 (Data Encoding)
+// Severity     : High
+// Frequency    : Every 4h (requires sufficient data volume — at least 2h lookback)
+// Author       : Kyriakos / SOC Team
+// Last Updated : 2025-06-01
+// References   :
+//   - https://attack.mitre.org/techniques/T1071/
+//   - https://www.activecountermeasures.com/ac-hunter-use-case-beacon-detection/
+//   - https://github.com/activecm/rita (RITA — Real Intelligence Threat Analytics)
+// ─────────────────────────────────────────────────────────
+
+// --- TUNING NOTES ---
+// MinConnections: Increase to reduce noise. Beacons need sufficient samples.
+//   10 connections minimum is a reasonable floor; 20+ builds higher confidence.
+// MaxJitterPct: Cobalt Strike default jitter is 0–50%. Set to 0.30 for tighter
+//   detection of well-configured beacons; raise to 0.50 to catch jittered ones.
+// ExcludedDestinations: Add known monitoring, telemetry, and update endpoints.
+//   Use a watchlist for scalable management across rules.
+// The time-delta stdev approach is a simplified RITA-style heuristic.
+//   For production, consider pairing with RITA or a dedicated hunting notebook.
+// ─────────────────────────────────────────────────────────
+
+let LookbackPeriod      = 6h;
+let MinConnections      = 10;     // Minimum connections to analyse for periodicity
+let MaxTimeDeltaStdev   = 60.0;   // Max std deviation in seconds (low = highly periodic)
+let MaxJitterPct        = 0.35;   // Max coefficient of variation (stdev/mean) allowed
+let MinBeaconIntervalS  = 10;     // Ignore sub-10s connections (keepalives, streaming)
+let MaxBeaconIntervalS  = 3600;   // Ignore connections > 1h apart (not beacon-like)
+
+let ExcludedDestinations = dynamic([
+    "8.8.8.8", "8.8.4.4",          // Google DNS
+    "1.1.1.1", "1.0.0.1",          // Cloudflare DNS
+    "13.107.4.52",                  // Microsoft O365
+    "40.90.4.0/24",                 // Azure Monitor
+    "ocsp.digicert.com",
+    "ocsp.pki.goog"
+]);
+
+CommonSecurityLog
+| where TimeGenerated >= ago(LookbackPeriod)
+| where CommunicationDirection == "Outbound"
+| where isnotempty(DestinationIP)
+| where DestinationIP !in (ExcludedDestinations)
+// Exclude RFC1918 (internal traffic)
+| where DestinationIP !startswith "10."
+    and DestinationIP !startswith "192.168."
+    and not(DestinationIP matches regex @"^172\.(1[6-9]|2[0-9]|3[01])\.")
+// Focus on common C2 ports — adjust for your environment
+| where DestinationPort in (80, 443, 8080, 8443, 4443, 4444, 1337, 8888)
+| summarize
+    ConnectionTimes = make_list(TimeGenerated),
+    BytesSentList   = make_list(SentBytes),
+    BytesRecvList   = make_list(ReceivedBytes),
+    TotalBytes      = sum(SentBytes + ReceivedBytes),
+    ConnectionCount = count()
+    by SourceIP, DeviceName, DestinationIP, DestinationPort, ApplicationProtocol
+| where ConnectionCount >= MinConnections
+// Calculate time deltas between consecutive connections
+| extend SortedTimes = array_sort_asc(ConnectionTimes)
+| mv-apply with_itemindex=i T = SortedTimes to typeof(datetime) on (
+    extend PrevT = iff(i > 0, prev(T), datetime(null))
+    | where isnotnull(PrevT)
+    | extend DeltaSeconds = datetime_diff('second', T, PrevT)
+    | where DeltaSeconds between (MinBeaconIntervalS .. MaxBeaconIntervalS)
+    | summarize
+        AvgDeltaSeconds = avg(DeltaSeconds),
+        StdevDelta      = stdev(DeltaSeconds),
+        MinDelta        = min(DeltaSeconds),
+        MaxDelta        = max(DeltaSeconds),
+        ValidDeltas     = count()
+)
+| where ValidDeltas >= (MinConnections - 1)
+// Coefficient of variation: low = highly periodic
+| extend CoeffVariation = StdevDelta / AvgDeltaSeconds
+| where StdevDelta <= MaxTimeDeltaStdev
+    or CoeffVariation <= MaxJitterPct
+// Score by confidence
+| extend BeaconConfidence = case(
+    StdevDelta <= 15 and CoeffVariation <= 0.10, "Very High",
+    StdevDelta <= 30 and CoeffVariation <= 0.20, "High",
+    StdevDelta <= 60 and CoeffVariation <= 0.35, "Medium",
+    "Low"
+)
+| extend
+    Severity = case(
+        BeaconConfidence == "Very High", "High",
+        BeaconConfidence == "High", "High",
+        BeaconConfidence == "Medium", "Medium",
+        "Low"
+    ),
+    BeaconIntervalMinutes = round(AvgDeltaSeconds / 60.0, 1),
+    RiskReason = strcat(
+        DeviceName, " made ", ConnectionCount, " connections to ", DestinationIP, ":", DestinationPort,
+        " with average interval of ", round(AvgDeltaSeconds / 60.0, 1), " min",
+        " (stdev: ", round(StdevDelta, 1), "s, CoV: ", round(CoeffVariation * 100, 1), "%).",
+        " Consistent with C2 beaconing. Confidence: ", BeaconConfidence, "."
+    ),
+    MitreTactic    = "Command and Control",
+    MitreTechnique = "T1071"
+| project
+    DeviceName,
+    SourceIP,
+    DestinationIP,
+    DestinationPort,
+    ConnectionCount,
+    BeaconIntervalMinutes,
+    StdevDelta      = round(StdevDelta, 1),
+    CoeffVariation  = round(CoeffVariation * 100, 1),
+    TotalBytes,
+    BeaconConfidence,
+    Severity,
+    RiskReason,
+    MitreTactic,
+    MitreTechnique
+| order by BeaconConfidence asc, CoeffVariation asc
